@@ -11,3 +11,5 @@ class Router:
         self.routes = {}
         self.announcements = {}
         self.sockets = {}
+
+        for neighbor_arg in neighbors:
