@@ -72,7 +72,6 @@ class Router:
         if not network or not netmask:
             return
 
-        # store announcement
         key = (network, netmask)
         self.announcements[key] = {
             "network": network,
@@ -85,8 +84,6 @@ class Router:
         }
 
         print("Update for %s/%s from %s" % (network, netmask, srcif))
-
-        # propagate to neighbors based on relationship
         self.propagate_update(key, srcif)
 
     # handle route withdrawal
@@ -143,20 +140,30 @@ class Router:
             "dst": msg.get("src"),
             "msg": []
         }
-        for announcement in self.announcements.values():
+        
+        # get unique networks and select best route for each
+        networks = {}
+        for (network, netmask), ann in self.announcements.items():
+            key = (network, netmask)
+            if key not in networks:
+                networks[key] = ann
+            elif self._is_better(ann, networks[key]):
+                networks[key] = ann
+        
+        for ann in networks.values():
             response["msg"].append({
-                "network": announcement["network"],
-                "netmask": announcement["netmask"],
-                "localpref": announcement["localpref"],
-                "selfOrigin": announcement["selfOrigin"],
-                "ASPath": announcement["ASPath"],
-                "origin": announcement["origin"],
-                "peer": announcement["peer"]
+                "network": ann["network"],
+                "netmask": ann["netmask"],
+                "localpref": ann["localpref"],
+                "selfOrigin": ann["selfOrigin"],
+                "ASPath": ann["ASPath"],
+                "origin": ann["origin"],
+                "peer": ann["peer"]
             })
 
         self.send(srcif, json.dumps(response))
         print("Sent table with %d routes" % len(response["msg"]))
-
+        
     # send update to other neighbors based on relationships
     def propagate_update(self, key, srcif):
         announcement = self.announcements[key]
@@ -223,6 +230,24 @@ class Router:
                 }
                 self.send(neighbor, json.dumps(msg))
 
+    # return true if new is better than current
+    def _is_better(self, new, current):
+        # higher localpref
+        if new["localpref"] != current["localpref"]:
+            return new["localpref"] > current["localpref"]
+        # shorter ASPath
+        if len(new["ASPath"]) != len(current["ASPath"]):
+            return len(new["ASPath"]) < len(current["ASPath"])
+        if new["selfOrigin"] != current["selfOrigin"]:
+            return new["selfOrigin"]
+        origin_rank = {"IGP": 0, "EGP": 1, "UNK": 2}
+        new_rank = origin_rank.get(new["origin"], 3)
+        curr_rank = origin_rank.get(current["origin"], 3)
+        if new_rank != curr_rank:
+            return new_rank < curr_rank
+        # lowest peer IP
+        return self.ip_to_int(new["peer"]) < self.ip_to_int(current["peer"])
+    
     # find best route to destination using longest prefix match
     def longest_prefix_match(self, dst_ip):
         dst_int = self.ip_to_int(dst_ip)
