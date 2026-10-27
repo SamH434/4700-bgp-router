@@ -7,34 +7,24 @@ class Router:
     relations = {}
     sockets = {}
     ports = {}
-    announcements = {}
 
     def __init__(self, asn, connections):
         print("Router at AS %s starting up" % asn)
         self.asn = asn
-        self.announcements = {}
+        self.routes = []
+        # forwarding table built from self.routes (aggregated)
+        self.table = []
 
         for relationship in connections:
-            parts = relationship.split("-")
-            port = int(parts[0])
-            neighbor = parts[1]
-            relation = parts[2]
+            port, neighbor, relation = relationship.split("-")
 
             self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sockets[neighbor].bind(('localhost', 0))
-            self.ports[neighbor] = port
+            self.ports[neighbor] = int(port)
             self.relations[neighbor] = relation
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
 
-            # send handshake to neighbor
-            handshake = {
-                "type": "handshake",
-                "src": self.our_addr(neighbor),
-                "dst": neighbor,
-                "msg": {}
-            }
-            self.send(neighbor, json.dumps(handshake))
-
-    # calculate our address based on destination
+    # our address on the link to a neighbor
     def our_addr(self, dst):
         quads = list(int(qdn) for qdn in dst.split('.'))
         quads[3] = 1
@@ -44,264 +34,182 @@ class Router:
     def send(self, network, message):
         self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
 
-    # process incoming message based on type
-    def handle_message(self, srcif, msg_dict):
-        msg_type = msg_dict.get("type")
+    # convert dotted quad string to 32 bit integer
+    def ip_to_int(self, ip):
+        parts = [int(x) for x in ip.split('.')]
+        return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
 
-        if msg_type == "handshake":
-            self.handle_handshake(srcif, msg_dict)
-        elif msg_type == "update":
-            self.handle_update(srcif, msg_dict)
-        elif msg_type == "withdraw":
-            self.handle_withdraw(srcif, msg_dict)
-        elif msg_type == "data":
-            self.handle_data(srcif, msg_dict)
-        elif msg_type == "dump":
-            self.handle_dump(srcif, msg_dict)
+    # convert 32 bit integer back to dotted quad string
+    def int_to_ip(self, num):
+        return "%d.%d.%d.%d" % ((num >> 24) & 255, (num >> 16) & 255, (num >> 8) & 255, num & 255)
 
-    # handle incoming handshake
-    def handle_handshake(self, srcif, msg):
-        print("Handshake from %s" % srcif)
+    # number of 1 bits in a netmask
+    def mask_len(self, netmask):
+        return bin(self.ip_to_int(netmask)).count('1')
+
+    # build a netmask string from a prefix length
+    def len_to_mask(self, length):
+        return self.int_to_ip((0xFFFFFFFF << (32 - length)) & 0xFFFFFFFF)
+
+    # decide who gets a copy of an update/withdraw that came from srcif
+    def should_forward(self, srcif, neighbor):
+        if neighbor == srcif:
+            return False
+        return self.relations[srcif] == "cust" or self.relations[neighbor] == "cust"
 
     # handle route update message
     def handle_update(self, srcif, msg):
-        msg_data = msg.get("msg", {})
-        network = msg_data.get("network")
-        netmask = msg_data.get("netmask")
-
-        if not network or not netmask:
-            return
-
-        key = (network, netmask)
-        self.announcements[key] = {
-            "network": network,
-            "netmask": netmask,
-            "localpref": msg_data.get("localpref", 0),
-            "selfOrigin": msg_data.get("selfOrigin", False),
-            "ASPath": msg_data.get("ASPath", []),
-            "origin": msg_data.get("origin", "UNK"),
+        m = msg["msg"]
+        self.routes.append({
+            "network": m["network"],
+            "netmask": m["netmask"],
+            "localpref": m["localpref"],
+            "selfOrigin": m["selfOrigin"],
+            "ASPath": m["ASPath"],
+            "origin": m["origin"],
             "peer": srcif
-        }
-
-        print("Update for %s/%s from %s" % (network, netmask, srcif))
-        self.propagate_update(key, srcif)
-
-    # handle route withdrawal
-    def handle_withdraw(self, srcif, msg):
-        msg_data = msg.get("msg", [])
-
-        for route in msg_data:
-            network = route.get("network")
-            netmask = route.get("netmask")
-            key = (network, netmask)
-
-            # only remove if this peer announced it
-            if key in self.announcements:
-                if self.announcements[key].get("peer") == srcif:
-                    del self.announcements[key]
-                    print("Withdrew %s/%s" % (network, netmask))
-
-        self.propagate_withdraw(msg_data, srcif)
-
-    # handle data message, forward to destination
-    def handle_data(self, srcif, msg):
-        dst_ip = msg.get("dst")
-        src_ip = msg.get("src")
-
-        if not dst_ip:
-            return
-
-        route = self.longest_prefix_match(dst_ip)
-
-        if not route:
-            # no route found
-            response = {
-                "type": "no route",
-                "src": self.our_addr(srcif),
-                "dst": src_ip,
-                "msg": {}
-            }
-            self.send(srcif, json.dumps(response))
-            print("No route to %s" % dst_ip)
-            return
-
-        next_hop = route["peer"]
-        try:
-            self.send(next_hop, json.dumps(msg))
-            print("Forwarded data to %s via %s" % (dst_ip, next_hop))
-        except:
-            print("Failed to forward to %s" % next_hop)
-
-    # handle dump request, respond with routing table
-    def handle_dump(self, srcif, msg):
-        response = {
-            "type": "table",
-            "src": self.our_addr(srcif),
-            "dst": msg.get("src"),
-            "msg": []
-        }
-        
-        # get unique networks and select best route for each
-        networks = {}
-        for (network, netmask), ann in self.announcements.items():
-            key = (network, netmask)
-            if key not in networks:
-                networks[key] = ann
-            elif self._is_better(ann, networks[key]):
-                networks[key] = ann
-        
-        for ann in networks.values():
-            response["msg"].append({
-                "network": ann["network"],
-                "netmask": ann["netmask"],
-                "localpref": ann["localpref"],
-                "selfOrigin": ann["selfOrigin"],
-                "ASPath": ann["ASPath"],
-                "origin": ann["origin"],
-                "peer": ann["peer"]
-            })
-
-        self.send(srcif, json.dumps(response))
-        print("Sent table with %d routes" % len(response["msg"]))
-        
-    # send update to other neighbors based on relationships
-    def propagate_update(self, key, srcif):
-        announcement = self.announcements[key]
-        src_relation = self.relations.get(srcif)
-
-        if not src_relation:
-            return
-
-        # determine which neighbors to send to
-        for neighbor in self.sockets.keys():
-            if neighbor == srcif:
-                continue
-
-            neighbor_relation = self.relations.get(neighbor)
-
-            # apply BGP rules
-            if src_relation == "cust":
-                # from customer: send to all
-                should_send = True
-            elif src_relation == "peer" or src_relation == "prov":
-                # from peer/provider: only send to customers
-                should_send = (neighbor_relation == "cust")
-            else:
-                should_send = False
-            if should_send:
-                msg = {
+        })
+        self.rebuild_table()
+       
+        for neighbor in self.sockets:
+            if self.should_forward(srcif, neighbor):
+                out = {
                     "type": "update",
                     "src": self.our_addr(neighbor),
                     "dst": neighbor,
                     "msg": {
-                        "network": announcement["network"],
-                        "netmask": announcement["netmask"],
-                        "ASPath": [self.asn] + announcement["ASPath"]
+                        "network": m["network"],
+                        "netmask": m["netmask"],
+                        "ASPath": [self.asn] + m["ASPath"]
                     }
                 }
-                self.send(neighbor, json.dumps(msg))
+                self.send(neighbor, json.dumps(out))
 
-    # propagate route withdrawals to neighbors
-    def propagate_withdraw(self, routes, srcif):
-        src_relation = self.relations.get(srcif)
+    # handle route withdrawal
+    def handle_withdraw(self, srcif, msg):
+        for dead in msg["msg"]:
+            self.routes = [r for r in self.routes
+                           if not (r["peer"] == srcif and r["network"] == dead["network"] and r["netmask"] == dead["netmask"])]
+        # rebuild from scratch so anything aggregated gets split back up
+        self.rebuild_table()
 
-        if not src_relation:
-            return
-
-        for neighbor in self.sockets.keys():
-            if neighbor == srcif:
-                continue
-
-            neighbor_relation = self.relations.get(neighbor)
-
-            # apply BGP rules
-            if src_relation == "cust":
-                should_send = True
-            elif src_relation == "peer" or src_relation == "prov":
-                should_send = (neighbor_relation == "cust")
-            else:
-                should_send = False
-            if should_send:
-                msg = {
+        for neighbor in self.sockets:
+            if self.should_forward(srcif, neighbor):
+                out = {
                     "type": "withdraw",
                     "src": self.our_addr(neighbor),
                     "dst": neighbor,
-                    "msg": routes
+                    "msg": msg["msg"]
                 }
-                self.send(neighbor, json.dumps(msg))
+                self.send(neighbor, json.dumps(out))
 
-    # return true if new is better than current
-    def _is_better(self, new, current):
-        # higher localpref
-        if new["localpref"] != current["localpref"]:
-            return new["localpref"] > current["localpref"]
-        # shorter ASPath
-        if len(new["ASPath"]) != len(current["ASPath"]):
-            return len(new["ASPath"]) < len(current["ASPath"])
-        if new["selfOrigin"] != current["selfOrigin"]:
-            return new["selfOrigin"]
-        origin_rank = {"IGP": 0, "EGP": 1, "UNK": 2}
-        new_rank = origin_rank.get(new["origin"], 3)
-        curr_rank = origin_rank.get(current["origin"], 3)
-        if new_rank != curr_rank:
-            return new_rank < curr_rank
-        # lowest peer IP
-        return self.ip_to_int(new["peer"]) < self.ip_to_int(current["peer"])
-    
-    # find best route to destination using longest prefix match
-    def longest_prefix_match(self, dst_ip):
-        dst_int = self.ip_to_int(dst_ip)
-        best_match = None
-        best_prefix_len = -1
+    # rebuild forwarding table from all saved routes and aggregate it
+    def rebuild_table(self):
+        self.table = [dict(r) for r in self.routes]
+        self.aggregate()
 
-        for (network, netmask), announcement in self.announcements.items():
-            net_int = self.ip_to_int(network)
-            mask_int = self.ip_to_int(netmask)
+    # two routes can be merged if everything except the network matches
+    def same_attributes(self, a, b):
+        return (a["peer"] == b["peer"] and a["netmask"] == b["netmask"] and
+                a["localpref"] == b["localpref"] and a["selfOrigin"] == b["selfOrigin"] and
+                a["ASPath"] == b["ASPath"] and a["origin"] == b["origin"])
 
-            # check if destination matches this network
-            if (dst_int & mask_int) == (net_int & mask_int):
-                prefix_len = bin(mask_int).count('1')
+    # merge numerically adjacent routes into one shorter prefix
+    def aggregate(self):
+        merged = True
+        while merged:
+            merged = False
+            for i in range(len(self.table)):
+                for j in range(len(self.table)):
+                    a = self.table[i]
+                    b = self.table[j]
+                    if i == j or not self.same_attributes(a, b):
+                        continue
+                    length = self.mask_len(a["netmask"])
+                    if length == 0:
+                        continue
+                    shorter = self.ip_to_int(self.len_to_mask(length - 1))
+                    a_net = self.ip_to_int(a["network"])
+                    b_net = self.ip_to_int(b["network"])
+                    if a_net != b_net and (a_net & shorter) == (b_net & shorter):
+                        a["network"] = self.int_to_ip(a_net & shorter)
+                        a["netmask"] = self.len_to_mask(length - 1)
+                        del self.table[j]
+                        merged = True
+                        break
+                if merged:
+                    break
 
-                if prefix_len > best_prefix_len:
-                    best_prefix_len = prefix_len
-                    best_match = announcement
+    # return true if route a is better than route b (used when prefixes are equal)
+    def is_better(self, a, b):
+        if a["localpref"] != b["localpref"]:
+            return a["localpref"] > b["localpref"]
+        if a["selfOrigin"] != b["selfOrigin"]:
+            return a["selfOrigin"]
+        if len(a["ASPath"]) != len(b["ASPath"]):
+            return len(a["ASPath"]) < len(b["ASPath"])
+        rank = {"IGP": 0, "EGP": 1, "UNK": 2}
+        if rank[a["origin"]] != rank[b["origin"]]:
+            return rank[a["origin"]] < rank[b["origin"]]
+        return self.ip_to_int(a["peer"]) < self.ip_to_int(b["peer"])
 
-        return best_match
+    # find best route for a destination (longest prefix first, then tie breaking rules)
+    def best_route(self, dst):
+        dst_int = self.ip_to_int(dst)
+        best = None
+        for r in self.table:
+            mask = self.ip_to_int(r["netmask"])
+            if (dst_int & mask) != (self.ip_to_int(r["network"]) & mask):
+                continue
+            if best is None:
+                best = r
+            elif self.mask_len(r["netmask"]) > self.mask_len(best["netmask"]):
+                best = r
+            elif self.mask_len(r["netmask"]) == self.mask_len(best["netmask"]) and self.is_better(r, best):
+                best = r
+        return best
 
-    # convert IP address string to 32 bit integer
-    def ip_to_int(self, ip):
-        parts = [int(x) for x in ip.split('.')]
-        return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+    # handle data message
+    def handle_data(self, srcif, msg):
+        route = self.best_route(msg["dst"])
+
+        if route and (self.relations[srcif] == "cust" or self.relations[route["peer"]] == "cust"):
+            self.send(route["peer"], json.dumps(msg))
+        else:
+            reply = { "type": "no route", "src": self.our_addr(srcif), "dst": msg["src"], "msg": {} }
+            self.send(srcif, json.dumps(reply))
+
+    # handle dump request
+    def handle_dump(self, srcif, msg):
+        reply = { "type": "table", "src": self.our_addr(srcif), "dst": msg["src"], "msg": self.table }
+        self.send(srcif, json.dumps(reply))
 
     def run(self):
         while True:
             socks = select.select(self.sockets.values(), [], [], 0.1)[0]
             for conn in socks:
-                try:
-                    k, addr = conn.recvfrom(65535)
-                    srcif = None
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = json.loads(k.decode('utf-8'))
 
-                    for sock in self.sockets:
-                        if self.sockets[sock] == conn:
-                            srcif = sock
-                            break
-
-                    msg = k.decode('utf-8')
-                    msg_dict = json.loads(msg)
-
-                    print("Received message type '%s' from %s" % (msg_dict.get("type"), srcif))
-
-                    self.handle_message(srcif, msg_dict)
-
-                except Exception as e:
-                    print("Error processing message: %s" % e)
+                if msg["type"] == "update":
+                    self.handle_update(srcif, msg)
+                elif msg["type"] == "withdraw":
+                    self.handle_withdraw(srcif, msg)
+                elif msg["type"] == "data":
+                    self.handle_data(srcif, msg)
+                elif msg["type"] == "dump":
+                    self.handle_dump(srcif, msg)
         return
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='BGP Router')
+    parser = argparse.ArgumentParser(description='route packets')
     parser.add_argument('asn', type=int, help="AS number of this router")
-    parser.add_argument('connections', metavar='connections', type=str, nargs='+',
-                        help="connections to neighbors in format: port-ip-relation")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
     args = parser.parse_args()
     router = Router(args.asn, args.connections)
     router.run()
