@@ -1,2 +1,2 @@
-   all:
-   	chmod +x 4700router
+all:
+	chmod +x 4700router
